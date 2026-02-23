@@ -1,0 +1,7 @@
+jittor
+numpy
+opencv-python
+pyyaml
+easydict
+tensorboard
+Pillow

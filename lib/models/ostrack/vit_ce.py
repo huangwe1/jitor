@@ -1,0 +1,231 @@
+import math
+import logging
+from functools import partial
+import os
+
+import jittor as jt
+from jittor import nn
+
+from lib.models.layers.jittor_utils import to_2tuple
+
+
+def _normalize(x, dim=-1, eps=1e-12):
+    norm = jt.sqrt((x * x).sum(dim=dim, keepdims=True) + eps)
+    return x / norm
+from lib.models.layers.patch_embed import PatchEmbed
+from .utils import combine_tokens, recover_tokens
+from .vit import VisionTransformer
+from ..layers.attn_blocks import CEBlock
+
+_logger = logging.getLogger(__name__)
+
+
+class VisionTransformerCE(VisionTransformer):
+    """ Vision Transformer with candidate elimination (CE) module """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
+                 num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
+                 act_layer=None, weight_init='',
+                 ce_loc=None, ce_keep_ratio=None):
+        super().__init__()
+        if isinstance(img_size, tuple):
+            self.img_size = img_size
+        else:
+            self.img_size = to_2tuple(img_size)
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+
+        self.num_classes = num_classes
+        self.num_features = self.embed_dim = embed_dim
+        self.num_tokens = 2 if distilled else 1
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        act_layer = act_layer or nn.GELU
+
+        self.patch_embed = embed_layer(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.dist_token = jt.zeros(1, 1, embed_dim) if distilled else None
+        self.pos_embed = jt.zeros(1, num_patches + self.num_tokens, embed_dim)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in jt.linspace(0, drop_path_rate, depth)]
+        blocks = []
+        ce_index = 0
+        self.ce_loc = ce_loc
+        for i in range(depth):
+            ce_keep_ratio_i = 1.0
+            if ce_loc is not None and i in ce_loc:
+                ce_keep_ratio_i = ce_keep_ratio[ce_index]
+                ce_index += 1
+
+            blocks.append(
+                CEBlock(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
+                    attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
+                    keep_ratio_search=ce_keep_ratio_i)
+            )
+
+        self.blocks = nn.Sequential(*blocks)
+        self.norm = norm_layer(embed_dim)
+
+        self.init_weights(weight_init)
+
+        ## resolution 256
+        self.language_proj = nn.Linear(768, 768)
+        self.language_xz_proj = nn.Linear(768, 256)
+        self.vision_x_proj = nn.Linear(256 * 768, 256)
+        self.vision_z_proj = nn.Linear(64 * 768, 256)
+
+    def forward_features(self, z, x, language_embeddings,
+                         mask_z=None, mask_x=None,
+                         ce_template_mask=None, ce_keep_rate=None,
+                         return_last_attn=False):
+        B, H, W = x.shape[0], x.shape[2], x.shape[3]
+
+        ## resolution 256: language_embeddings: 32*768*1*1-->32*768-->32*1*768
+        language_embeddings = _normalize(
+            self.language_proj(language_embeddings.squeeze().reshape(-1, 1, 768)), dim=2)
+        language_embeddings_x = language_embeddings.repeat(1, 256, 1)
+        language_embeddings_z = language_embeddings.repeat(1, 64, 1)
+
+        x = self.patch_embed(x)   # 32*3*256*256->32*256*768
+        z = self.patch_embed(z)   # 32*3*128*128->32*64*768
+
+        # Multi-Modal Alignment
+        language_vectors = language_embeddings.squeeze(1)   # 32*1*768->32*768
+        language_vectors = _normalize(self.language_xz_proj(language_vectors), dim=1)  # 32*768->32*256
+
+        vision_x_vectors = _normalize(
+            self.vision_x_proj(jt.flatten(x, start_dim=1)), dim=1)  # 32*(256*768)->32*256
+
+        vision_z_vectors = _normalize(
+            self.vision_z_proj(jt.flatten(z, start_dim=1)), dim=1)  # 32*(64*768)->32*256
+
+        # Modal Mixup
+        x = language_embeddings_x * x + x
+        z = language_embeddings_z * z + z
+
+        if mask_z is not None and mask_x is not None:
+            mask_z = nn.interpolate(mask_z.unsqueeze(0).float(), scale_factor=1. / self.patch_size).bool().squeeze(0)
+            mask_z = mask_z.flatten(1).unsqueeze(-1)
+
+            mask_x = nn.interpolate(mask_x.unsqueeze(0).float(), scale_factor=1. / self.patch_size).bool().squeeze(0)
+            mask_x = mask_x.flatten(1).unsqueeze(-1)
+
+            mask_x = combine_tokens(mask_z, mask_x, mode=self.cat_mode)
+            mask_x = mask_x.squeeze(-1)
+
+        if self.add_cls_token:
+            cls_tokens = self.cls_token.expand([B, -1, -1])
+            cls_tokens = cls_tokens + self.cls_pos_embed
+
+        z = z + self.pos_embed_z
+        x = x + self.pos_embed_x
+
+        if self.add_sep_seg:
+            x = x + self.search_segment_pos_embed
+            z = z + self.template_segment_pos_embed
+
+        x = combine_tokens(z, x, mode=self.cat_mode)
+        if self.add_cls_token:
+            x = jt.concat([cls_tokens, x], dim=1)
+
+        x = self.pos_drop(x)
+
+        lens_z = self.pos_embed_z.shape[1]
+        lens_x = self.pos_embed_x.shape[1]
+
+        global_index_t = jt.linspace(0, lens_z - 1, lens_z).float()
+        global_index_t = global_index_t.unsqueeze(0).repeat(B, 1)
+
+        global_index_s = jt.linspace(0, lens_x - 1, lens_x).float()
+        global_index_s = global_index_s.unsqueeze(0).repeat(B, 1)
+
+        removed_indexes_s = []
+        for i, blk in enumerate(self.blocks):
+            x, global_index_t, global_index_s, removed_index_s, attn = \
+                blk(x, global_index_t, global_index_s, mask_x, ce_template_mask, ce_keep_rate)
+
+            if self.ce_loc is not None and i in self.ce_loc:
+                removed_indexes_s.append(removed_index_s)
+
+        x = self.norm(x)
+        lens_x_new = global_index_s.shape[1]
+        lens_z_new = global_index_t.shape[1]
+
+        z = x[:, :lens_z_new]
+        x = x[:, lens_z_new:]
+
+        if removed_indexes_s and removed_indexes_s[0] is not None:
+            removed_indexes_cat = jt.concat(removed_indexes_s, dim=1)
+
+            pruned_lens_x = lens_x - lens_x_new
+            pad_x = jt.zeros([B, pruned_lens_x, x.shape[2]])
+            x = jt.concat([x, pad_x], dim=1)
+            index_all = jt.concat([global_index_s, removed_indexes_cat], dim=1)
+
+            C = x.shape[-1]
+            index_sorted = index_all.unsqueeze(-1).expand([B, -1, C]).int64()
+            x_new = jt.zeros_like(x)
+            for b in range(B):
+                for j in range(index_sorted.shape[1]):
+                    idx = int(index_sorted[b, j, 0].item())
+                    x_new[b, idx] = x[b, j]
+            x = x_new
+
+        x = recover_tokens(x, lens_z_new, lens_x, mode=self.cat_mode)
+
+        x = jt.concat([z, x], dim=1)
+
+        aux_dict = {
+            "language_vectors": language_vectors,
+            "vision_x_vectors": vision_x_vectors,
+            "vision_z_vectors": vision_z_vectors,
+            "attn": attn,
+            "removed_indexes_s": removed_indexes_s,
+        }
+
+        return x, aux_dict
+
+    def execute(self, z, x, language_embeddings, ce_template_mask=None, ce_keep_rate=None,
+                tnc_keep_rate=None,
+                return_last_attn=False):
+        x, aux_dict = self.forward_features(z, x, language_embeddings,
+                                            ce_template_mask=ce_template_mask, ce_keep_rate=ce_keep_rate)
+        return x, aux_dict
+
+
+def _create_vision_transformer(pretrained=False, **kwargs):
+    model = VisionTransformerCE(**kwargs)
+
+    if pretrained:
+        if 'npz' in pretrained:
+            model.load_pretrained(pretrained, prefix='')
+        else:
+            checkpoint = jt.load(pretrained)
+            if isinstance(checkpoint, dict) and "model" in checkpoint:
+                state_dict = checkpoint["model"]
+            else:
+                state_dict = checkpoint
+            model.load_state_dict(state_dict)
+            print('Load pretrained model from: ' + pretrained)
+
+    return model
+
+
+def vit_base_patch16_224_ce(pretrained=False, **kwargs):
+    """ ViT-Base model (ViT-B/16) """
+    model_kwargs = dict(
+        patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
+    model = _create_vision_transformer(pretrained=pretrained, **model_kwargs)
+    return model
+
+
+def vit_large_patch16_224_ce(pretrained=False, **kwargs):
+    """ ViT-Large model (ViT-L/16) """
+    model_kwargs = dict(
+        patch_size=16, embed_dim=1024, depth=24, num_heads=16, **kwargs)
+    model = _create_vision_transformer(pretrained=pretrained, **model_kwargs)
+    return model

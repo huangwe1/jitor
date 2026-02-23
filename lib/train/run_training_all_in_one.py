@@ -1,0 +1,85 @@
+import warnings
+warnings.filterwarnings("ignore")
+import os
+import sys
+import argparse
+import importlib
+
+import random
+import numpy as np
+import jittor as jt
+
+import _init_paths
+import lib.train.admin.settings as ws_settings
+
+
+def init_seeds(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    jt.set_global_seed(seed)
+
+
+def run_training(script_name, config_name, cudnn_benchmark=True, local_rank=-1, save_dir=None, base_seed=None,
+                 use_lmdb=False, script_name_prv=None, config_name_prv=None, use_wandb=False,
+                 distill=None, script_teacher=None, config_teacher=None):
+
+    if save_dir is None:
+        print("save_dir dir is not given. Use the default dir instead.")
+
+    print('script_name: {}.py  config_name: {}.yaml'.format(script_name, config_name))
+
+    if base_seed is not None:
+        init_seeds(base_seed)
+
+    # Use CUDA if available
+    if jt.has_cuda:
+        jt.flags.use_cuda = 1
+
+    settings = ws_settings.Settings()
+    settings.script_name = script_name
+    settings.config_name = config_name
+    settings.project_path = 'train/{}/{}'.format(script_name, config_name)
+    if script_name_prv is not None and config_name_prv is not None:
+        settings.project_path_prv = 'train/{}/{}'.format(script_name_prv, config_name_prv)
+    settings.local_rank = local_rank
+    settings.save_dir = os.path.abspath(save_dir)
+    settings.use_lmdb = use_lmdb
+    prj_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    settings.cfg_file = os.path.join(prj_dir, 'experiments/%s/%s.yaml' % (script_name, config_name))
+    settings.use_wandb = use_wandb
+
+    expr_module = importlib.import_module('lib.train.train_script')
+    expr_func = getattr(expr_module, 'run')
+    expr_func(settings)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Run a train scripts in train_settings.')
+    parser.add_argument('--script', type=str, default='ostrack', help='Name of the train script.')
+    parser.add_argument('--config', type=str, default='vitb_256_mae_ce_32x4_ep300', help="Name of the config file.")
+    parser.add_argument('--cudnn_benchmark', type=bool, default=True)
+    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--save_dir', type=str, default='./output', help='the directory to save checkpoints and logs')
+    parser.add_argument('--seed', type=int, default=42, help='seed for random numbers')
+    parser.add_argument('--use_lmdb', type=int, choices=[0, 1], default=0)
+    parser.add_argument('--script_prv', type=str, default=None)
+    parser.add_argument('--config_prv', type=str, default=None)
+    parser.add_argument('--use_wandb', type=int, choices=[0, 1], default=0)
+    parser.add_argument('--distill', type=int, choices=[0, 1], default=0)
+    parser.add_argument('--script_teacher', type=str, help='teacher script name')
+    parser.add_argument('--config_teacher', type=str, help='teacher yaml configure file name')
+
+    args = parser.parse_args()
+
+    if jt.has_cuda:
+        jt.flags.use_cuda = 1
+
+    run_training(args.script, args.config, cudnn_benchmark=args.cudnn_benchmark,
+                 local_rank=args.local_rank, save_dir=args.save_dir, base_seed=args.seed,
+                 use_lmdb=args.use_lmdb, script_name_prv=args.script_prv, config_name_prv=args.config_prv,
+                 use_wandb=args.use_wandb,
+                 distill=args.distill, script_teacher=args.script_teacher, config_teacher=args.config_teacher)
+
+
+if __name__ == '__main__':
+    main()
